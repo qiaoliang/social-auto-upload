@@ -615,6 +615,15 @@ class TencentBaseUploader(BaseVideoUploader):
         )
         if await collection_elements.count() > 1:
             await page.get_by_text("添加到合集").locator("xpath=following-sibling::div").click()
+            # 按名称匹配指定合集
+            collection_name = getattr(self, "collection", None)
+            if collection_name:
+                for option in await collection_elements.all():
+                    text = await option.text_content()
+                    if text and collection_name in text.strip():
+                        await option.click()
+                        return
+            # fallback: 选第一个
             await collection_elements.first.click()
 
     async def apply_original_statement(self, page: Page) -> None:
@@ -777,6 +786,7 @@ class TencentVideo(TencentBaseUploader):
         publish_date: datetime | int,
         account_file,
         category=None,
+        collection=None,
         is_draft=False,
         desc: str | None = None,
         thumbnail_path: str | None = None,
@@ -798,6 +808,7 @@ class TencentVideo(TencentBaseUploader):
         self.file_path = file_path
         self.tags = tags or []
         self.category = category
+        self.collection = collection
         self.is_draft = is_draft
         self.desc = desc or ""
         self.thumbnail_path = thumbnail_path

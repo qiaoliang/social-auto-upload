@@ -162,6 +162,7 @@ class TencentVideoUploadRequest:
     thumbnail_portrait_file: Path | None = None
     short_title: str | None = None
     category: str | None = None
+    collection: str | None = None
     is_draft: bool = False
     publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
@@ -531,6 +532,7 @@ async def upload_tencent_video(request: TencentVideoUploadRequest) -> Path:
         publish_date=request.publish_date,
         account_file=str(account_file),
         category=request.category,
+        collection=request.collection,
         is_draft=request.is_draft,
         desc=request.description,
         thumbnail_path=str(request.thumbnail_file) if request.thumbnail_file else None,
@@ -713,6 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
     tencent_upload_video_parser.add_argument("--thumbnail-portrait", type=existing_file_path, help="Optional 3:4 portrait thumbnail path")
     tencent_upload_video_parser.add_argument("--short-title", help="Optional WeChat Channels short title")
     tencent_upload_video_parser.add_argument("--category", help="Optional original content category")
+    tencent_upload_video_parser.add_argument("--collection", help="Optional collection/album name to add the video to")
     tencent_upload_video_parser.add_argument("--draft", action="store_true", help="Save as draft instead of publishing")
     add_runtime_flags(tencent_upload_video_parser)
 
@@ -973,6 +976,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 thumbnail_portrait_file=args.thumbnail_portrait,
                 short_title=args.short_title,
                 category=args.category,
+                collection=args.collection,
                 is_draft=args.draft,
                 publish_strategy=publish_strategy,
                 debug=args.debug,
