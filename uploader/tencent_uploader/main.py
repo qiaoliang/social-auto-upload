@@ -5,6 +5,7 @@ import asyncio
 import base64
 import inspect
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
@@ -21,8 +22,10 @@ from utils.log import tencent_logger
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
 TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
+TENCENT_DRAFT_LIST_URL = "https://channels.weixin.qq.com/platform/post/draftListManager"
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
+MAX_SUBMIT_ATTEMPTS = 5
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -747,34 +750,104 @@ class TencentBaseUploader(BaseVideoUploader):
                 await asyncio.sleep(2)
 
     async def submit_publish(self, page: Page) -> None:
-        while True:
+        if getattr(self, "is_draft", False):
+            await self._save_draft(page)
+        else:
+            await self._publish_now(page)
+
+    async def _wait_draft_saved_signal(self, page: Page, timeout: float = 15.0) -> bool:
+        """等待草稿保存成功的页面信号：toast 提示、保存草稿按钮消失或 URL 跳转。"""
+        toast_selectors = [
+            "div.weui-desktop-toast",
+            "div[class*='toast']",
+            "div.weui-desktop-message",
+        ]
+        saved_keywords = ("保存成功", "已保存", "草稿已保存")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current_url = page.url
+            if "post/list" in current_url or "draft" in current_url:
+                return True
+            for selector in toast_selectors:
+                try:
+                    toasts = page.locator(selector)
+                    for i in range(await toasts.count()):
+                        text = (await toasts.nth(i).inner_text()) or ""
+                        if any(kw in text for kw in saved_keywords):
+                            return True
+                except Exception:
+                    continue
             try:
-                if getattr(self, "is_draft", False):
-                    draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
-                    if await draft_button.count():
-                        await draft_button.click()
-                    await page.wait_for_url("**/post/list**", timeout=5000)
-                    tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
+                draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
+                if not await draft_button.count():
+                    return True
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
+        return False
+
+    async def _confirm_draft_in_list(self, page: Page, timeout: float = 30.0) -> bool:
+        """跳转到草稿箱列表页，按标题确认草稿已在列。"""
+        try:
+            await page.goto(TENCENT_DRAFT_LIST_URL, timeout=60000, wait_until="domcontentloaded")
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"跳转草稿箱列表页失败: {exc}"))
+            return False
+
+        title = getattr(self, "title", "") or ""
+        short_title = getattr(self, "short_title", "") or ""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                body_text = await page.locator("body").inner_text()
+                if (title and title in body_text) or (short_title and short_title in body_text):
+                    return True
+            except Exception:
+                pass
+            await page.wait_for_timeout(1000)
+        return False
+
+    async def _save_draft(self, page: Page) -> None:
+        """草稿模式：点「保存草稿」→ 等成功信号 → 草稿箱列表确认标题在列。"""
+        for attempt in range(1, MAX_SUBMIT_ATTEMPTS + 1):
+            try:
+                draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
+                if await draft_button.count():
+                    await draft_button.click()
+                    tencent_logger.info(_msg("🖱️", f"已点击「保存草稿」（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）"))
                 else:
-                    publish_button = page.locator('div.form-btns button:has-text("发表")')
-                    if await publish_button.count():
-                        await publish_button.click()
-                    await page.wait_for_url(TENCENT_MANAGE_URL, timeout=5000)
-                    tencent_logger.success(_msg("🥳", "视频发布成功"))
-                break
+                    tencent_logger.warning(_msg("😵", "未找到「保存草稿」按钮，尝试直接去草稿箱列表确认"))
+
+                saved = await self._wait_draft_saved_signal(page)
+                if not saved:
+                    tencent_logger.warning(_msg("😵", "未检测到保存成功信号，仍尝试去草稿箱列表确认"))
+
+                if await self._confirm_draft_in_list(page):
+                    tencent_logger.success(_msg("🥳", "视频草稿保存成功（草稿箱列表已确认）"))
+                    return
+                tencent_logger.warning(_msg("😵", f"草稿箱列表未确认到标题（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）"))
             except Exception as exc:
-                current_url = page.url
-                if getattr(self, "is_draft", False):
-                    if "post/list" in current_url or "draft" in current_url:
-                        tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
-                        break
-                else:
-                    if TENCENT_MANAGE_URL in current_url:
-                        tencent_logger.success(_msg("🥳", "视频发布成功"))
-                        break
-                tencent_logger.exception(f"  [-] Exception: {exc}")
-                tencent_logger.info(_msg("🏃", "视频正在发布中..."))
-                await asyncio.sleep(0.5)
+                tencent_logger.warning(_msg("😵", f"保存草稿异常（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）: {exc}"))
+            await asyncio.sleep(1)
+        raise RuntimeError(f"连续 {MAX_SUBMIT_ATTEMPTS} 次保存草稿均未确认成功，请人工检查草稿箱")
+
+    async def _publish_now(self, page: Page) -> None:
+        """正式发布：点「发表」→ 等 URL 跳转到发布列表。"""
+        for attempt in range(1, MAX_SUBMIT_ATTEMPTS + 1):
+            try:
+                publish_button = page.locator('div.form-btns button:has-text("发表")')
+                if await publish_button.count():
+                    await publish_button.click()
+                await page.wait_for_url(TENCENT_MANAGE_URL, timeout=10000)
+                tencent_logger.success(_msg("🥳", "视频发布成功"))
+                return
+            except Exception as exc:
+                if TENCENT_MANAGE_URL in page.url:
+                    tencent_logger.success(_msg("🥳", "视频发布成功"))
+                    return
+                tencent_logger.warning(_msg("😵", f"等待发布成功超时（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）: {exc}"))
+                await asyncio.sleep(1)
+        raise RuntimeError(f"连续 {MAX_SUBMIT_ATTEMPTS} 次发布均未确认成功，请人工检查")
 
 
 class TencentVideo(TencentBaseUploader):
