@@ -22,10 +22,12 @@ from utils.log import tencent_logger
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
 TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
-TENCENT_DRAFT_LIST_URL = "https://channels.weixin.qq.com/platform/post/draftListManager"
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 MAX_SUBMIT_ATTEMPTS = 5
+# 草稿保存确认超时：点击「保存草稿」后按钮 disabled → enabled 状态机等待时长（秒）。
+# 视频号拒绝保存（如短标题过长/过短、短标题含标点）时按钮不会恢复，超时即判定失败。
+DRAFT_SAVE_TIMEOUT = 10
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -702,19 +704,42 @@ class TencentBaseUploader(BaseVideoUploader):
                 except Exception:
                     continue
 
-        # 「视频标注」下拉框（AI 声明）：由 ai_generated 决定选第二项「含AI生成内容」或第一项「无需标注」
-        video_mark = page.locator('text="视频标注"').first
+        # 「视频标注」下拉框（AI 声明）：由 ai_generated 决定选「含AI生成内容」或「无需标注」
+        # 定位优先级：组件结构(.mark-tag-select .select-display) → 标签文本「视频标注」；已选中目标值则跳过（幂等）
+        target = "含AI生成内容" if self.ai_generated else "无需标注"
+
+        async def _read_select_value() -> str:
+            select_value = page.locator("div.mark-tag-select .select-value").first
+            if not await select_value.count():
+                return ""
+            return (await select_value.text_content() or "").strip()
+
         try:
-            if await video_mark.count() and await video_mark.is_visible():
-                await video_mark.click()
-                await page.wait_for_timeout(300)
-                target = "含AI生成内容" if self.ai_generated else "无需标注"
-                option = page.locator(f'text="{target}"').first
-                if await option.count() and await option.is_visible():
-                    await option.click()
-                    tencent_logger.info(_msg("🧾", f"视频标注已选择: {target}"))
+            select_display = page.locator("div.mark-tag-body .mark-tag-select .select-display").first
+            if not (await select_display.count() and await select_display.is_visible()):
+                video_mark = page.locator('text="视频标注"').first
+                if await video_mark.count() and await video_mark.is_visible():
+                    await video_mark.click()
+                    await page.wait_for_timeout(300)
+                    select_display = page.locator("div.mark-tag-body .mark-tag-select .select-display").first
+            if await select_display.count() and await select_display.is_visible():
+                current_value = await _read_select_value()
+                if current_value == target:
+                    tencent_logger.info(_msg("🧾", f"视频标注已是: {target}（跳过）"))
                 else:
-                    tencent_logger.warning(_msg("😵", f"视频标注下拉中未找到选项: {target}，继续前先人工确认页面"))
+                    await select_display.click()
+                    await page.wait_for_timeout(300)
+                    option = page.locator(f'text="{target}"').first
+                    if await option.count() and await option.is_visible():
+                        await option.click()
+                        await page.wait_for_timeout(300)
+                        confirmed = await _read_select_value()
+                        if confirmed == target:
+                            tencent_logger.info(_msg("🧾", f"视频标注已选择: {target}"))
+                        else:
+                            tencent_logger.warning(_msg("😵", f"视频标注点击后未生效（当前值: {confirmed or '空'}），继续前先人工确认页面"))
+                    else:
+                        tencent_logger.warning(_msg("😵", f"视频标注下拉中未找到选项: {target}，继续前先人工确认页面"))
             else:
                 tencent_logger.info(_msg("🧾", "当前页面未发现视频标注字段"))
         except Exception as exc:
@@ -759,81 +784,58 @@ class TencentBaseUploader(BaseVideoUploader):
         else:
             await self._publish_now(page)
 
-    async def _wait_draft_saved_signal(self, page: Page, timeout: float = 15.0) -> bool:
-        """等待草稿保存成功的页面信号：toast 提示、保存草稿按钮消失或 URL 跳转。"""
-        toast_selectors = [
-            "div.weui-desktop-toast",
-            "div[class*='toast']",
-            "div.weui-desktop-message",
-        ]
-        saved_keywords = ("保存成功", "已保存", "草稿已保存")
+    async def _wait_draft_saved_signal(self, page: Page, timeout: float = DRAFT_SAVE_TIMEOUT) -> bool:
+        """等待草稿保存完成的时机信号：保存草稿按钮由不可点击恢复为可点击。
+
+        页面实测行为：点击「保存草稿」后按钮立即变为不可点击（class 含
+        weui-desktop-btn_disabled），toast「已保存」出现后按钮恢复可点击，
+        页面不跳转、按钮不消失。因此以「按钮恢复可点击」作为保存完成的唯一信号。
+        超时未恢复 = 保存失败（视频号校验拒绝，如短标题过长/过短、含标点）。
+        """
+        draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
         deadline = time.monotonic() + timeout
+        saw_disabled = False
         while time.monotonic() < deadline:
-            current_url = page.url
-            if "post/list" in current_url or "draft" in current_url:
-                return True
-            for selector in toast_selectors:
-                try:
-                    toasts = page.locator(selector)
-                    for i in range(await toasts.count()):
-                        text = (await toasts.nth(i).inner_text()) or ""
-                        if any(kw in text for kw in saved_keywords):
-                            return True
-                except Exception:
-                    continue
             try:
-                draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
                 if not await draft_button.count():
+                    return False
+                btn_class = await draft_button.get_attribute("class") or ""
+                if "weui-desktop-btn_disabled" in btn_class:
+                    saw_disabled = True
+                elif saw_disabled:
                     return True
             except Exception:
                 pass
             await page.wait_for_timeout(500)
         return False
 
-    async def _confirm_draft_in_list(self, page: Page, timeout: float = 30.0) -> bool:
-        """跳转到草稿箱列表页，按标题确认草稿已在列。"""
-        try:
-            await page.goto(TENCENT_DRAFT_LIST_URL, timeout=60000, wait_until="domcontentloaded")
-        except Exception as exc:
-            tencent_logger.warning(_msg("😵", f"跳转草稿箱列表页失败: {exc}"))
-            return False
-
-        title = getattr(self, "title", "") or ""
-        short_title = getattr(self, "short_title", "") or ""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                body_text = await page.locator("body").inner_text()
-                if (title and title in body_text) or (short_title and short_title in body_text):
-                    return True
-            except Exception:
-                pass
-            await page.wait_for_timeout(1000)
-        return False
-
     async def _save_draft(self, page: Page) -> None:
-        """草稿模式：点「保存草稿」→ 等成功信号 → 草稿箱列表确认标题在列。"""
-        for attempt in range(1, MAX_SUBMIT_ATTEMPTS + 1):
-            try:
-                draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
-                if await draft_button.count():
-                    await draft_button.click()
-                    tencent_logger.info(_msg("🖱️", f"已点击「保存草稿」（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）"))
-                else:
-                    tencent_logger.warning(_msg("😵", "未找到「保存草稿」按钮，尝试直接去草稿箱列表确认"))
+        """草稿模式：点击「保存草稿」，以按钮 disabled→enabled 状态机确认保存成功。
 
-                saved = await self._wait_draft_saved_signal(page)
-                if not saved:
-                    tencent_logger.warning(_msg("😵", "未检测到保存成功信号，仍尝试去草稿箱列表确认"))
+        页面实测行为：点击后按钮立即变为 disabled，保存完成（toast「已保存」）后
+        恢复 enabled，页面不跳转、按钮不消失。故以「按钮恢复可点击」作为保存成功的
+        唯一确认信号，不再跳转草稿箱列表核对标题（draftListManager 会被重定向回
+        平台首页，且页面存在双重 body，标题匹配不可靠）。
 
-                if await self._confirm_draft_in_list(page):
-                    tencent_logger.success(_msg("🥳", "视频草稿保存成功（草稿箱列表已确认）"))
-                    return
-                tencent_logger.warning(_msg("😵", f"草稿箱列表未确认到标题（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）"))
-            except Exception as exc:
-                tencent_logger.warning(_msg("😵", f"保存草稿异常（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）: {exc}"))
-            await asyncio.sleep(1)
-        raise RuntimeError(f"连续 {MAX_SUBMIT_ATTEMPTS} 次保存草稿均未确认成功，请人工检查草稿箱")
+        超时（DRAFT_SAVE_TIMEOUT 秒）未从 disabled 恢复 = 保存失败。已知失败原因：
+        短标题过长/过短、短标题含标点（视频号校验不通过直接拒绝保存）。
+        """
+        draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
+        if not await draft_button.count():
+            raise RuntimeError("未找到「保存草稿」按钮，无法保存草稿")
+
+        await draft_button.click()
+        tencent_logger.info(_msg("🖱️", "已点击「保存草稿」，等待按钮状态机确认"))
+
+        if await self._wait_draft_saved_signal(page, timeout=DRAFT_SAVE_TIMEOUT):
+            tencent_logger.success(_msg("🥳", "视频草稿保存成功（按钮状态机确认）"))
+            return
+
+        raise RuntimeError(
+            f"保存草稿失败：{DRAFT_SAVE_TIMEOUT}s 内「保存草稿」按钮未从 disabled 恢复为 enabled。"
+            "常见原因：短标题过长/过短、短标题含标点。请检查 publish-props.yaml 的 "
+            "short_title（6-10 字、不含标点）后重试。"
+        )
 
     async def _publish_now(self, page: Page) -> None:
         """正式发布：点「发表」→ 等 URL 跳转到发布列表。"""
