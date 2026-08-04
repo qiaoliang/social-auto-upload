@@ -702,19 +702,30 @@ class TencentBaseUploader(BaseVideoUploader):
                 except Exception:
                     continue
 
-        # 「视频标注」下拉框（AI 声明）：由 ai_generated 决定选第二项「含AI生成内容」或第一项「无需标注」
-        video_mark = page.locator('text="视频标注"').first
+        # 「视频标注」下拉框（AI 声明）：由 ai_generated 决定选「含AI生成内容」或「无需标注」
+        # 定位优先级：组件结构(.mark-tag-select .select-display) → 标签文本「视频标注」；已选中目标值则跳过（幂等）
+        target = "含AI生成内容" if self.ai_generated else "无需标注"
         try:
-            if await video_mark.count() and await video_mark.is_visible():
-                await video_mark.click()
-                await page.wait_for_timeout(300)
-                target = "含AI生成内容" if self.ai_generated else "无需标注"
-                option = page.locator(f'text="{target}"').first
-                if await option.count() and await option.is_visible():
-                    await option.click()
-                    tencent_logger.info(_msg("🧾", f"视频标注已选择: {target}"))
+            select_display = page.locator("div.mark-tag-body .mark-tag-select .select-display").first
+            if not (await select_display.count() and await select_display.is_visible()):
+                video_mark = page.locator('text="视频标注"').first
+                if await video_mark.count() and await video_mark.is_visible():
+                    await video_mark.click()
+                    await page.wait_for_timeout(300)
+                    select_display = page.locator("div.mark-tag-body .mark-tag-select .select-display").first
+            if await select_display.count() and await select_display.is_visible():
+                current_value = (await page.locator("div.mark-tag-select .select-value").first.text_content() or "").strip()
+                if current_value == target:
+                    tencent_logger.info(_msg("🧾", f"视频标注已是: {target}（跳过）"))
                 else:
-                    tencent_logger.warning(_msg("😵", f"视频标注下拉中未找到选项: {target}，继续前先人工确认页面"))
+                    await select_display.click()
+                    await page.wait_for_timeout(300)
+                    option = page.locator(f'text="{target}"').first
+                    if await option.count() and await option.is_visible():
+                        await option.click()
+                        tencent_logger.info(_msg("🧾", f"视频标注已选择: {target}"))
+                    else:
+                        tencent_logger.warning(_msg("😵", f"视频标注下拉中未找到选项: {target}，继续前先人工确认页面"))
             else:
                 tencent_logger.info(_msg("🧾", "当前页面未发现视频标注字段"))
         except Exception as exc:
