@@ -705,6 +705,13 @@ class TencentBaseUploader(BaseVideoUploader):
         # 「视频标注」下拉框（AI 声明）：由 ai_generated 决定选「含AI生成内容」或「无需标注」
         # 定位优先级：组件结构(.mark-tag-select .select-display) → 标签文本「视频标注」；已选中目标值则跳过（幂等）
         target = "含AI生成内容" if self.ai_generated else "无需标注"
+
+        async def _read_select_value() -> str:
+            select_value = page.locator("div.mark-tag-select .select-value").first
+            if not await select_value.count():
+                return ""
+            return (await select_value.text_content() or "").strip()
+
         try:
             select_display = page.locator("div.mark-tag-body .mark-tag-select .select-display").first
             if not (await select_display.count() and await select_display.is_visible()):
@@ -714,7 +721,7 @@ class TencentBaseUploader(BaseVideoUploader):
                     await page.wait_for_timeout(300)
                     select_display = page.locator("div.mark-tag-body .mark-tag-select .select-display").first
             if await select_display.count() and await select_display.is_visible():
-                current_value = (await page.locator("div.mark-tag-select .select-value").first.text_content() or "").strip()
+                current_value = await _read_select_value()
                 if current_value == target:
                     tencent_logger.info(_msg("🧾", f"视频标注已是: {target}（跳过）"))
                 else:
@@ -723,7 +730,12 @@ class TencentBaseUploader(BaseVideoUploader):
                     option = page.locator(f'text="{target}"').first
                     if await option.count() and await option.is_visible():
                         await option.click()
-                        tencent_logger.info(_msg("🧾", f"视频标注已选择: {target}"))
+                        await page.wait_for_timeout(300)
+                        confirmed = await _read_select_value()
+                        if confirmed == target:
+                            tencent_logger.info(_msg("🧾", f"视频标注已选择: {target}"))
+                        else:
+                            tencent_logger.warning(_msg("😵", f"视频标注点击后未生效（当前值: {confirmed or '空'}），继续前先人工确认页面"))
                     else:
                         tencent_logger.warning(_msg("😵", f"视频标注下拉中未找到选项: {target}，继续前先人工确认页面"))
             else:
