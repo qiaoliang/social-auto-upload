@@ -502,6 +502,7 @@ class TencentBaseUploader(BaseVideoUploader):
         self.debug = debug
         self.headless = headless
         self.local_executable_path = LOCAL_CHROME_PATH
+        self.ai_generated = False  # 视频标注（AI 声明）默认「无需标注」；TencentVideo 由 --ai-generated 覆盖
 
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
@@ -701,20 +702,23 @@ class TencentBaseUploader(BaseVideoUploader):
                 except Exception:
                     continue
 
-        content_declaration = page.locator('text="内容声明"').first
+        # 「视频标注」下拉框（AI 声明）：由 ai_generated 决定选第二项「含AI生成内容」或第一项「无需标注」
+        video_mark = page.locator('text="视频标注"').first
         try:
-            if await content_declaration.count() and await content_declaration.is_visible():
-                await content_declaration.click()
-                for option_text in ("无需声明", "不声明", "无"):
-                    option = page.locator(f'text="{option_text}"').first
-                    if await option.count() and await option.is_visible():
-                        await option.click()
-                        tencent_logger.info(_msg("🧾", f"内容声明已选择: {option_text}"))
-                        break
+            if await video_mark.count() and await video_mark.is_visible():
+                await video_mark.click()
+                await page.wait_for_timeout(300)
+                target = "含AI生成内容" if self.ai_generated else "无需标注"
+                option = page.locator(f'text="{target}"').first
+                if await option.count() and await option.is_visible():
+                    await option.click()
+                    tencent_logger.info(_msg("🧾", f"视频标注已选择: {target}"))
+                else:
+                    tencent_logger.warning(_msg("😵", f"视频标注下拉中未找到选项: {target}，继续前先人工确认页面"))
             else:
-                tencent_logger.info(_msg("🧾", "当前页面未发现内容声明字段"))
+                tencent_logger.info(_msg("🧾", "当前页面未发现视频标注字段"))
         except Exception as exc:
-            tencent_logger.warning(_msg("😵", f"内容声明设置失败，继续前先人工确认页面: {exc}"))
+            tencent_logger.warning(_msg("😵", f"视频标注设置失败，继续前先人工确认页面: {exc}"))
 
         if not original_set:
             try:
@@ -861,6 +865,7 @@ class TencentVideo(TencentBaseUploader):
         category=None,
         collection=None,
         is_draft=False,
+        ai_generated=False,
         desc: str | None = None,
         thumbnail_path: str | None = None,
         thumbnail_landscape_path: str | None = None,
@@ -883,6 +888,7 @@ class TencentVideo(TencentBaseUploader):
         self.category = category
         self.collection = collection
         self.is_draft = is_draft
+        self.ai_generated = ai_generated
         self.desc = desc or ""
         self.thumbnail_path = thumbnail_path
         self.thumbnail_landscape_path = thumbnail_landscape_path

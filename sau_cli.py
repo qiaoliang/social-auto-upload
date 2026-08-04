@@ -164,6 +164,7 @@ class TencentVideoUploadRequest:
     category: str | None = None
     collection: str | None = None
     is_draft: bool = False
+    ai_generated: bool = False
     publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
@@ -534,6 +535,7 @@ async def upload_tencent_video(request: TencentVideoUploadRequest) -> Path:
         category=request.category,
         collection=request.collection,
         is_draft=request.is_draft,
+        ai_generated=request.ai_generated,
         desc=request.description,
         thumbnail_path=str(request.thumbnail_file) if request.thumbnail_file else None,
         thumbnail_landscape_path=(
@@ -717,6 +719,10 @@ def build_parser() -> argparse.ArgumentParser:
     tencent_upload_video_parser.add_argument("--category", help="Optional original content category")
     tencent_upload_video_parser.add_argument("--collection", help="Optional collection/album name to add the video to")
     tencent_upload_video_parser.add_argument("--draft", action="store_true", help="Save as draft instead of publishing")
+    tencent_upload_video_parser.add_argument(
+        "--ai-generated", choices=["true", "false"], default="false",
+        help="AI content declaration: true=含AI生成内容(视频标注第二项), false=无需标注(第一项)",
+    )
     add_runtime_flags(tencent_upload_video_parser)
 
     youtube_parser = platform_parsers.add_parser("youtube", help="YouTube operations")
@@ -978,6 +984,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 category=args.category,
                 collection=args.collection,
                 is_draft=args.draft,
+                ai_generated=(args.ai_generated == "true"),
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
