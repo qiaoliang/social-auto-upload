@@ -5,6 +5,7 @@ import asyncio
 import base64
 import inspect
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,32 @@ MAX_SUBMIT_ATTEMPTS = 5
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
+
+
+async def find_draft_item_by_title(page: Page, title: str, timeout: float = 30.0):
+    """在草稿箱列表页定位包含 title 的视频 item（独立函数，便于单独验证）。
+
+    覆盖两个已知失败点：
+    1. 列表 SPA 异步渲染 → 先等 .post-list-body 容器与 .post-draft-item 出现；
+    2. 标题文本差异（空白折叠/尾部截断）→ 去空白后只取前 10 个字符匹配。
+    返回命中的 item locator；超时或未命中返回 None。
+    """
+    list_body = page.locator(".post-list-body")
+    compact = "".join(title.split())
+    if not compact:
+        return None
+    pattern = re.compile(re.escape(compact[:10]))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if await list_body.count():
+                item = list_body.locator(".post-draft-item", has_text=pattern).first
+                if await item.count():
+                    return item
+        except Exception:
+            pass
+        await page.wait_for_timeout(1000)
+    return None
 
 
 def _resolve_account_file(account_file: str | Path) -> str:
@@ -816,16 +843,26 @@ class TencentBaseUploader(BaseVideoUploader):
             return False
 
         title = getattr(self, "title", "") or ""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                body_text = await page.locator("body").inner_text()
-                if title in body_text:
-                    return True
-            except Exception:
-                pass
-            await page.wait_for_timeout(1000)
+        if await find_draft_item_by_title(page, title, timeout) is not None:
+            return True
+        await self._log_draft_list_state(page)
         return False
+
+    async def _log_draft_list_state(self, page: Page) -> None:
+        """草稿箱确认失败时输出列表状态（容器/条目数/标题首行），便于定位是未渲染还是标题不匹配。"""
+        try:
+            list_body = page.locator(".post-list-body")
+            items = list_body.locator(".post-draft-item")
+            n = await items.count()
+            heads = []
+            for i in range(min(n, 10)):
+                text = (await items.nth(i).inner_text()).strip()
+                heads.append(text.splitlines()[0][:20] if text else "(空)")
+            tencent_logger.warning(
+                _msg("😵", f"草稿箱列表诊断: 容器={await list_body.count()}, item={n}, 标题首行={heads}")
+            )
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"草稿箱列表诊断失败: {exc}"))
 
     async def _save_draft(self, page: Page) -> None:
         """草稿模式：点击「保存草稿」两次（双保险，间隔等按钮恢复）→ 草稿箱列表确认标题在列。
