@@ -26,7 +26,7 @@ TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
 TENCENT_DRAFT_LIST_URL = "https://channels.weixin.qq.com/platform/post/draftListManager"
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
-MAX_SUBMIT_ATTEMPTS = 5
+MAX_SUBMIT_ATTEMPTS = 2
 
 
 def _msg(emoji: str, text: str) -> str:
