@@ -5,7 +5,6 @@ import asyncio
 import base64
 import inspect
 import os
-import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,40 +22,16 @@ from utils.log import tencent_logger
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
 TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
-TENCENT_DRAFT_LIST_URL = "https://channels.weixin.qq.com/platform/post/draftListManager"
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
-MAX_SUBMIT_ATTEMPTS = 2
+MAX_SUBMIT_ATTEMPTS = 5
+# 草稿保存确认超时：点击「保存草稿」后按钮 disabled → enabled 状态机等待时长（秒）。
+# 视频号拒绝保存（如短标题过长/过短、短标题含标点）时按钮不会恢复，超时即判定失败。
+DRAFT_SAVE_TIMEOUT = 10
 
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
-
-
-async def find_draft_item_by_title(page: Page, title: str, timeout: float = 30.0):
-    """在草稿箱列表页定位包含 title 的视频 item（独立函数，便于单独验证）。
-
-    覆盖两个已知失败点：
-    1. 列表 SPA 异步渲染 → 先等 .post-list-body 容器与 .post-draft-item 出现；
-    2. 标题文本差异（空白折叠/尾部截断）→ 去空白后只取前 10 个字符匹配。
-    返回命中的 item locator；超时或未命中返回 None。
-    """
-    list_body = page.locator(".post-list-body")
-    compact = "".join(title.split())
-    if not compact:
-        return None
-    pattern = re.compile(re.escape(compact[:10]))
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if await list_body.count():
-                item = list_body.locator(".post-draft-item", has_text=pattern).first
-                if await item.count():
-                    return item
-        except Exception:
-            pass
-        await page.wait_for_timeout(1000)
-    return None
 
 
 def _resolve_account_file(account_file: str | Path) -> str:
@@ -809,13 +784,13 @@ class TencentBaseUploader(BaseVideoUploader):
         else:
             await self._publish_now(page)
 
-    async def _wait_draft_saved_signal(self, page: Page, timeout: float = 15.0) -> bool:
+    async def _wait_draft_saved_signal(self, page: Page, timeout: float = DRAFT_SAVE_TIMEOUT) -> bool:
         """等待草稿保存完成的时机信号：保存草稿按钮由不可点击恢复为可点击。
 
         页面实测行为：点击「保存草稿」后按钮立即变为不可点击（class 含
         weui-desktop-btn_disabled），toast「已保存」出现后按钮恢复可点击，
-        页面不跳转、按钮不消失。因此以「按钮恢复可点击」作为本次保存完成的信号，
-        可进行下一次保存或去草稿箱列表验证。
+        页面不跳转、按钮不消失。因此以「按钮恢复可点击」作为保存完成的唯一信号。
+        超时未恢复 = 保存失败（视频号校验拒绝，如短标题过长/过短、含标点）。
         """
         draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
         deadline = time.monotonic() + timeout
@@ -834,68 +809,33 @@ class TencentBaseUploader(BaseVideoUploader):
             await page.wait_for_timeout(500)
         return False
 
-    async def _confirm_draft_in_list(self, page: Page, timeout: float = 30.0) -> bool:
-        """跳转到草稿箱列表页，按标题确认草稿已在列（只验证 title）。"""
-        try:
-            await page.goto(TENCENT_DRAFT_LIST_URL, timeout=60000, wait_until="domcontentloaded")
-        except Exception as exc:
-            tencent_logger.warning(_msg("😵", f"跳转草稿箱列表页失败: {exc}"))
-            return False
-
-        title = getattr(self, "title", "") or ""
-        if await find_draft_item_by_title(page, title, timeout) is not None:
-            return True
-        await self._log_draft_list_state(page)
-        return False
-
-    async def _log_draft_list_state(self, page: Page) -> None:
-        """草稿箱确认失败时输出列表状态（容器/条目数/标题首行），便于定位是未渲染还是标题不匹配。"""
-        try:
-            list_body = page.locator(".post-list-body")
-            items = list_body.locator(".post-draft-item")
-            n = await items.count()
-            heads = []
-            for i in range(min(n, 10)):
-                text = (await items.nth(i).inner_text()).strip()
-                heads.append(text.splitlines()[0][:20] if text else "(空)")
-            tencent_logger.warning(
-                _msg("😵", f"草稿箱列表诊断: 容器={await list_body.count()}, item={n}, 标题首行={heads}")
-            )
-        except Exception as exc:
-            tencent_logger.warning(_msg("😵", f"草稿箱列表诊断失败: {exc}"))
-
     async def _save_draft(self, page: Page) -> None:
-        """草稿模式：点击「保存草稿」两次（双保险，间隔等按钮恢复）→ 草稿箱列表确认标题在列。
+        """草稿模式：点击「保存草稿」，以按钮 disabled→enabled 状态机确认保存成功。
 
-        双保险：视频号支持多次保存（覆盖语义，不会产生重复草稿），两次点击降低
-        单次点击未生效导致漏存的风险。每次点击后等按钮恢复可点击（保存完成）再
-        进行下一次操作。
+        页面实测行为：点击后按钮立即变为 disabled，保存完成（toast「已保存」）后
+        恢复 enabled，页面不跳转、按钮不消失。故以「按钮恢复可点击」作为保存成功的
+        唯一确认信号，不再跳转草稿箱列表核对标题（draftListManager 会被重定向回
+        平台首页，且页面存在双重 body，标题匹配不可靠）。
+
+        超时（DRAFT_SAVE_TIMEOUT 秒）未从 disabled 恢复 = 保存失败。已知失败原因：
+        短标题过长/过短、短标题含标点（视频号校验不通过直接拒绝保存）。
         """
-        for attempt in range(1, MAX_SUBMIT_ATTEMPTS + 1):
-            try:
-                draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
-                if await draft_button.count():
-                    await draft_button.click()
-                    tencent_logger.info(_msg("🖱️", f"已点击「保存草稿」（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次，第 1 下）"))
-                else:
-                    tencent_logger.warning(_msg("😵", "未找到「保存草稿」按钮，尝试直接去草稿箱列表确认"))
+        draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
+        if not await draft_button.count():
+            raise RuntimeError("未找到「保存草稿」按钮，无法保存草稿")
 
-                await self._wait_draft_saved_signal(page)
+        await draft_button.click()
+        tencent_logger.info(_msg("🖱️", "已点击「保存草稿」，等待按钮状态机确认"))
 
-                # 双保险：等按钮恢复可点击后再点第二次
-                if await draft_button.count():
-                    await draft_button.click()
-                    tencent_logger.info(_msg("🖱️", f"已再次点击「保存草稿」（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次，第 2 下）"))
-                    await self._wait_draft_saved_signal(page)
+        if await self._wait_draft_saved_signal(page, timeout=DRAFT_SAVE_TIMEOUT):
+            tencent_logger.success(_msg("🥳", "视频草稿保存成功（按钮状态机确认）"))
+            return
 
-                if await self._confirm_draft_in_list(page):
-                    tencent_logger.success(_msg("🥳", "视频草稿保存成功（草稿箱列表已确认）"))
-                    return
-                tencent_logger.warning(_msg("😵", f"草稿箱列表未确认到标题（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）"))
-            except Exception as exc:
-                tencent_logger.warning(_msg("😵", f"保存草稿异常（第 {attempt}/{MAX_SUBMIT_ATTEMPTS} 次）: {exc}"))
-            await asyncio.sleep(1)
-        raise RuntimeError(f"连续 {MAX_SUBMIT_ATTEMPTS} 次保存草稿均未确认成功，请人工检查草稿箱")
+        raise RuntimeError(
+            f"保存草稿失败：{DRAFT_SAVE_TIMEOUT}s 内「保存草稿」按钮未从 disabled 恢复为 enabled。"
+            "常见原因：短标题过长/过短、短标题含标点。请检查 publish-props.yaml 的 "
+            "short_title（6-10 字、不含标点）后重试。"
+        )
 
     async def _publish_now(self, page: Page) -> None:
         """正式发布：点「发表」→ 等 URL 跳转到发布列表。"""
