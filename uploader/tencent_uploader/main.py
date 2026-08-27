@@ -22,12 +22,14 @@ from utils.log import tencent_logger
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
 TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
+TENCENT_DRAFT_LIST_URL = "https://channels.weixin.qq.com/platform/post/draftListManager"
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 MAX_SUBMIT_ATTEMPTS = 5
-# 草稿保存确认超时：点击「保存草稿」后按钮 disabled → enabled 状态机等待时长（秒）。
-# 视频号拒绝保存（如短标题过长/过短、短标题含标点）时按钮不会恢复，超时即判定失败。
-DRAFT_SAVE_TIMEOUT = 10
+# 草稿保存确认：点击「保存草稿」最多 N 次后，进草稿箱列表页按标题前缀模糊匹配确认。
+# 完成信号 = 列表页文本包含标题前 6 字符宽度前缀（去空格）。避免无限重试造成重复保存。
+DRAFT_CLICK_ATTEMPTS = 3
+DRAFT_CONFIRM_TIMEOUT = 30
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -108,6 +110,29 @@ def format_str_for_short_title(origin_title: str) -> str:
         formatted_string += " " * (6 - len(formatted_string))
 
     return formatted_string
+
+
+def _normalize_title(title: str) -> str:
+    """标题规范化：去除半角/全角空格，用于前缀模糊匹配。"""
+    return title.replace(" ", "").replace("\u3000", "")
+
+
+def _title_match_prefix(title: str, width: int = 6) -> str:
+    """按显示宽度截取标题前缀：中文/全角字符=1 宽度，英文/数字=0.5 宽度（2 个英文=1 个中文）。
+
+    截取内容中的空格全部去除（先经 _normalize_title），宽度累计达 width 即停。
+    例：6 个中文字符，或 12 个英文字符，或混合按宽度折算。
+    """
+    s = _normalize_title(title)
+    out: list[str] = []
+    w = 0.0
+    for ch in s:
+        chw = 1.0 if ord(ch) > 0x2E80 else 0.5
+        if w + chw > width:
+            break
+        out.append(ch)
+        w += chw
+    return "".join(out)
 
 
 async def cookie_auth(account_file):
@@ -784,58 +809,64 @@ class TencentBaseUploader(BaseVideoUploader):
         else:
             await self._publish_now(page)
 
-    async def _wait_draft_saved_signal(self, page: Page, timeout: float = DRAFT_SAVE_TIMEOUT) -> bool:
-        """等待草稿保存完成的时机信号：保存草稿按钮由不可点击恢复为可点击。
-
-        页面实测行为：点击「保存草稿」后按钮立即变为不可点击（class 含
-        weui-desktop-btn_disabled），toast「已保存」出现后按钮恢复可点击，
-        页面不跳转、按钮不消失。因此以「按钮恢复可点击」作为保存完成的唯一信号。
-        超时未恢复 = 保存失败（视频号校验拒绝，如短标题过长/过短、含标点）。
-        """
-        draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
-        deadline = time.monotonic() + timeout
-        saw_disabled = False
-        while time.monotonic() < deadline:
-            try:
-                if not await draft_button.count():
-                    return False
-                btn_class = await draft_button.get_attribute("class") or ""
-                if "weui-desktop-btn_disabled" in btn_class:
-                    saw_disabled = True
-                elif saw_disabled:
-                    return True
-            except Exception:
-                pass
-            await page.wait_for_timeout(500)
-        return False
-
     async def _save_draft(self, page: Page) -> None:
-        """草稿模式：点击「保存草稿」，以按钮 disabled→enabled 状态机确认保存成功。
+        """草稿模式：点击「保存草稿」最多 DRAFT_CLICK_ATTEMPTS 次，然后进草稿箱列表按标题确认。
 
-        页面实测行为：点击后按钮立即变为 disabled，保存完成（toast「已保存」）后
-        恢复 enabled，页面不跳转、按钮不消失。故以「按钮恢复可点击」作为保存成功的
-        唯一确认信号，不再跳转草稿箱列表核对标题（draftListManager 会被重定向回
-        平台首页，且页面存在双重 body，标题匹配不可靠）。
+        完成信号 = 草稿箱列表页（draftListManager）文本包含标题前缀（前 6 字符宽度、去空格）。
 
-        超时（DRAFT_SAVE_TIMEOUT 秒）未从 disabled 恢复 = 保存失败。已知失败原因：
-        短标题过长/过短、短标题含标点（视频号校验不通过直接拒绝保存）。
+        点击前检查按钮可点（disabled 不点），点击 3 次后无论是否出现成功提示都进列表确认，
+        避免按钮已保存成功后继续重复点击（历史问题：wait_for_url 5s 超时 + 无限重试）。
+        列表确认与上传同 page/context（登录态完整）；独立浏览器访问 draftListManager 会被
+        跳转到登录页，无法确认标题。
         """
         draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
         if not await draft_button.count():
             raise RuntimeError("未找到「保存草稿」按钮，无法保存草稿")
 
-        await draft_button.click()
-        tencent_logger.info(_msg("🖱️", "已点击「保存草稿」，等待按钮状态机确认"))
+        for attempt in range(1, DRAFT_CLICK_ATTEMPTS + 1):
+            try:
+                if await draft_button.is_enabled():
+                    await draft_button.click()
+                    tencent_logger.info(_msg("🖱️", f"已点击「保存草稿」（第 {attempt}/{DRAFT_CLICK_ATTEMPTS} 次）"))
+            except Exception as exc:
+                tencent_logger.warning(_msg("😵", f"第 {attempt} 次点击「保存草稿」异常: {exc}"))
+            await page.wait_for_timeout(2000)
 
-        if await self._wait_draft_saved_signal(page, timeout=DRAFT_SAVE_TIMEOUT):
-            tencent_logger.success(_msg("🥳", "视频草稿保存成功（按钮状态机确认）"))
+        if await self._confirm_draft_in_list(page):
+            tencent_logger.success(_msg("🥳", "视频草稿保存成功（草稿箱列表标题确认）"))
             return
 
         raise RuntimeError(
-            f"保存草稿失败：{DRAFT_SAVE_TIMEOUT}s 内「保存草稿」按钮未从 disabled 恢复为 enabled。"
-            "常见原因：短标题过长/过短、短标题含标点。请检查 publish-props.yaml 的 "
-            "short_title（6-10 字、不含标点）后重试。"
+            f"保存草稿确认失败：草稿箱列表未找到标题前缀「{_title_match_prefix(getattr(self, 'title', '') or '')}」。"
+            "常见原因：短标题过长/过短、短标题含标点（视频号校验拒绝保存）。请人工检查视频号草稿箱后重试。"
         )
+
+    async def _confirm_draft_in_list(self, page: Page, timeout: float = DRAFT_CONFIRM_TIMEOUT) -> bool:
+        """跳转到草稿箱列表页（同一 page 会话，登录态完整），按标题前缀模糊匹配确认草稿在列。
+
+        历史坑：页面存在双重 body，用 locator('body').first 避免 strict 报错；
+        draftListManager 必须在 sau 登录会话内访问，独立浏览器会跳转登录页。
+        """
+        try:
+            await page.goto(TENCENT_DRAFT_LIST_URL, timeout=60000, wait_until="domcontentloaded")
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"跳转草稿箱列表页失败: {exc}"))
+            return False
+
+        prefix = _title_match_prefix(getattr(self, "title", "") or "")
+        if not prefix:
+            return False
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                body_text = await page.locator("body").first.inner_text()
+                if prefix in _normalize_title(body_text):
+                    return True
+            except Exception:
+                pass
+            await page.wait_for_timeout(1000)
+        return False
 
     async def _publish_now(self, page: Page) -> None:
         """正式发布：点「发表」→ 等 URL 跳转到发布列表。"""
