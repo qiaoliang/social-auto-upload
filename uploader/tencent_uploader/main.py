@@ -5,6 +5,7 @@ import asyncio
 import base64
 import inspect
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -113,8 +114,12 @@ def format_str_for_short_title(origin_title: str) -> str:
 
 
 def _normalize_title(title: str) -> str:
-    """标题规范化：去除半角/全角空格，用于前缀模糊匹配。"""
-    return title.replace(" ", "").replace("\u3000", "")
+    """标题规范化：去除空白与所有标点/符号（半角全角、中英文），仅保留汉字/字母/数字，用于模糊匹配。
+
+    视频号平台会把标题中的标点规范化（如全角逗号→全角冒号），因此匹配前必须去标点，
+    否则「反差式休息，」与「反差式休息：」这类标点差异会导致失配。
+    """
+    return re.sub(r"[\W_]+", "", title)
 
 
 def _title_match_prefix(title: str, width: int = 6) -> str:
@@ -844,8 +849,10 @@ class TencentBaseUploader(BaseVideoUploader):
     async def _confirm_draft_in_list(self, page: Page, timeout: float = DRAFT_CONFIRM_TIMEOUT) -> bool:
         """跳转到草稿箱列表页（同一 page 会话，登录态完整），按标题前缀模糊匹配确认草稿在列。
 
-        历史坑：页面存在双重 body，用 locator('body').first 避免 strict 报错；
+        历史坑：页面存在双重 body（__finder-page 与 #container-wrap），裸 body 会 strict 报错、
+        body.first 可能取到空 body——遍历所有 body 取文本合并后匹配；
         draftListManager 必须在 sau 登录会话内访问，独立浏览器会跳转登录页。
+        匹配同时用 title 与 short_title 的前缀（列表可能显示任一）。
         """
         try:
             await page.goto(TENCENT_DRAFT_LIST_URL, timeout=60000, wait_until="domcontentloaded")
@@ -853,19 +860,41 @@ class TencentBaseUploader(BaseVideoUploader):
             tencent_logger.warning(_msg("😵", f"跳转草稿箱列表页失败: {exc}"))
             return False
 
-        prefix = _title_match_prefix(getattr(self, "title", "") or "")
-        if not prefix:
+        prefixes = [
+            p for p in (
+                _title_match_prefix(getattr(self, "title", "") or ""),
+                _title_match_prefix(getattr(self, "short_title", "") or ""),
+            ) if p
+        ]
+        if not prefixes:
             return False
 
         deadline = time.monotonic() + timeout
+        full_text = ""
         while time.monotonic() < deadline:
             try:
-                body_text = await page.locator("body").first.inner_text()
-                if prefix in _normalize_title(body_text):
+                bodies = page.locator("body")
+                n = await bodies.count()
+                full_text = ""
+                for i in range(n):
+                    try:
+                        full_text += await bodies.nth(i).inner_text()
+                    except Exception:
+                        pass
+                norm = _normalize_title(full_text)
+                if any(p in norm for p in prefixes):
                     return True
             except Exception:
                 pass
             await page.wait_for_timeout(1000)
+
+        try:
+            tencent_logger.warning(
+                _msg("😵", f"草稿箱确认失败：URL={page.url}，body 数={await page.locator('body').count()}，"
+                           f"文本片段={_normalize_title(full_text)[:120] if full_text else '(空)'}"))
+            await page.screenshot(path=str(Path(BASE_DIR) / "debug_draft_confirm_fail.png"), full_page=True)
+        except Exception:
+            pass
         return False
 
     async def _publish_now(self, page: Page) -> None:
